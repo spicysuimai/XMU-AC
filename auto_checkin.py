@@ -44,6 +44,7 @@ if not STUDENT_ID or not PASSWORD:
 
 BASE_URL = "https://lnt.xmu.edu.cn"
 SESSION_FILE = Path(__file__).resolve().parent / "auto_checkin_session.json"
+RECORD_FILE = Path(__file__).resolve().parent / "checkin_record.json"
 
 HEADERS_BASE = {
     "accept": "application/json, text/plain, */*",
@@ -64,6 +65,21 @@ MAX_UNKNOWN_RETRIES = 10
 # ============================================================
 # 登录模块：xmulogin + cookie 持久化
 # ============================================================
+
+def record_ok(rtype, course, detail):
+    """追加一条成功签到记录（供控制台实时展示今日已签到课程）"""
+    try:
+        recs = []
+        if RECORD_FILE.exists():
+            recs = json.loads(RECORD_FILE.read_text(encoding="utf-8"))
+        recs.append({
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": rtype, "course": course, "detail": detail,
+        })
+        RECORD_FILE.write_text(json.dumps(recs[-200:], ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
 
 def _save_cookies(session):
     """保存完整 cookie jar 到文件（含 domain/path/expires/secure 等属性）"""
@@ -589,6 +605,7 @@ def main_loop():
                             ok = answer_number(rid, code, session)
                             if ok:
                                 seen.add(rid)
+                                record_ok("数字", name, f"码={code}")
                                 events.append(f"[OK] 数字 {name} 码={code}")
                             else:
                                 events.append(f"[FAIL] 数字 {name} 提交失败，将重试")
@@ -599,6 +616,7 @@ def main_loop():
                         ok, lat, lon = answer_radar_auto(rid, session)
                         if ok:
                             seen.add(rid)
+                            record_ok("GPS", name, f"({lat:.4f}, {lon:.4f})")
                             events.append(f"[OK] GPS {name} ({lat:.4f}, {lon:.4f})")
                         else:
                             events.append(f"[FAIL] GPS {name} 将重试")
