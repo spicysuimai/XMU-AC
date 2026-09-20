@@ -31,6 +31,13 @@ STUDENT_ID = os.environ.get("STUDENT_ID")
 PASSWORD = os.environ.get("PASSWORD")
 INTERVAL = 15           # 轮询间隔秒数
 # GPS 坐标通过三角定位自动获取，无需手动填写
+
+# ---- 签到门控：等班里先签的人多了再签，避免总是第一个签 ----
+CHECKIN_GATE = True          # 总开关；False = 发现即签（原行为）
+CHECKIN_RATIO = 0.25         # 已签人数 > 全班人数 × 此比例（1/4）才签
+CHECKIN_MIN_SIGNED = 20      # 已签人数 > 此值也直接签
+CHECKIN_MAX_WAIT = 120       # 等待超过此秒数直接签（保底）
+CHECKIN_MIN_REMAINING = 30   # 距签到结束不足此秒数立即签（保底）
 # ============================================================
 
 if not STUDENT_ID:
@@ -258,6 +265,57 @@ def check_rollcall_status(rollcall_id, session):
     return None
 
 
+def get_signed_stats(rollcall_id, session):
+    """查询签到进度，返回 (signed, total, end_time) 或 (None, None, None)。
+
+    已签人数只认 rollcall_status == "on_call_fine"；名单总人数即本班应到人数。
+    注意不能用 updated_at 判断：本校名单里缺勤学生也带 updated_at。
+    """
+    try:
+        r = session.get(
+            f"{BASE_URL}/api/rollcall/{rollcall_id}/student_rollcalls",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None, None, None
+        data = r.json()
+        students = data.get("student_rollcalls") if isinstance(data, dict) else None
+        if not isinstance(students, list) or not students:
+            return None, None, None
+        signed = sum(
+            1 for s in students
+            if isinstance(s, dict) and s.get("rollcall_status") == "on_call_fine"
+        )
+        return signed, len(students), data.get("end_time")
+    except Exception as e:
+        print(f"  [X] 查询签到人数失败: {e}")
+        return None, None, None
+
+
+def checkin_gate(rollcall_id, session, waited_sec):
+    """签到门控：判断是否应等班里更多人先签。
+
+    开签条件（任一满足）：已签 > 全班 1/4，或已签 > CHECKIN_MIN_SIGNED。
+    保底（漏签比早签更糟，以下情况直接放行）：查不到人数 / 等待超过
+    CHECKIN_MAX_WAIT 秒 / 距签到结束不足 CHECKIN_MIN_REMAINING 秒。
+    返回 (need_wait, msg)。
+    """
+    if not CHECKIN_GATE:
+        return False, ""
+    signed, total, end_time = get_signed_stats(rollcall_id, session)
+    if signed is None:
+        return False, "查不到签到人数，直接签"
+    msg = f"已签 {signed}/{total}"
+    if signed / total > CHECKIN_RATIO or signed > CHECKIN_MIN_SIGNED:
+        return False, f"{msg}，达标开签"
+    remaining = _time_remaining(end_time)
+    if waited_sec >= CHECKIN_MAX_WAIT:
+        return False, f"{msg}，等待超 {CHECKIN_MAX_WAIT}s，直接签"
+    if remaining is not None and remaining <= CHECKIN_MIN_REMAINING:
+        return False, f"{msg}，剩余 {int(remaining)}s，直接签"
+    return True, f"{msg}，未达标继续等"
+
+
 # ============================================================
 # GPS 三角定位（两条线交点反推目标坐标）
 # ============================================================
@@ -420,17 +478,23 @@ ACTIVE_STATUSES = {
 }
 
 
-def _end_time_passed(end_time):
-    """检查 end_time 是否已过"""
+def _time_remaining(end_time):
+    """距 end_time 还剩多少秒；无 end_time 或解析失败返回 None"""
     if not end_time:
-        return False
+        return None
     try:
         dt = datetime.fromisoformat(str(end_time).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt < datetime.now(timezone.utc)
+        return (dt - datetime.now(timezone.utc)).total_seconds()
     except Exception:
-        return False
+        return None
+
+
+def _end_time_passed(end_time):
+    """检查 end_time 是否已过"""
+    remaining = _time_remaining(end_time)
+    return remaining is not None and remaining <= 0
 
 
 def _is_terminal(status, end_time):
@@ -497,6 +561,8 @@ def dashboard(courses, seen_count, query_count, start_time, events):
         f"时间: {t}    运行: {rt}",
         f"课程: {len(courses)} 门    查询: {query_count} 次",
         "GPS : 自动三角定位",
+        f"门控: 已签>{CHECKIN_RATIO:.0%} 或 >{CHECKIN_MIN_SIGNED} 人先签"
+        if CHECKIN_GATE else "门控: 关闭",
         sep,
     ]:
         _cline(line)
@@ -536,6 +602,8 @@ def main_loop():
     # 3. 监控循环
     seen = set()                # 已处理终端 / 已成功签到的 rid
     unknown_retries = {}        # rid → 未知状态重试次数
+    gate_since = {}             # rid → 首次进入门控的时间戳（计算等待时长）
+    last_wait_msg = {}          # rid → 上条 [WAIT] 消息（人数有变化才再报）
     events = []
     query_count = 0
     start_time = time.time()
@@ -598,7 +666,26 @@ def main_loop():
 
                     # 可以尝试签到
                     rtype = rollcall_label(rc)
-                    events.append(f"[NEW] {name} ({rtype})")
+
+                    # 签到门控：等班里先签的人够多再签，避免总是第一个签。
+                    # 等待期间 [NEW] 只报一次，[WAIT] 只在人数变化时报，防止刷屏。
+                    if rc.get("is_number") or rc.get("is_radar"):
+                        now_ts = time.time()
+                        since = gate_since.setdefault(rid, now_ts)
+                        if since == now_ts:
+                            events.append(f"[NEW] {name} ({rtype})")
+                        need_wait, gate_msg = checkin_gate(rid, session, now_ts - since)
+                        if need_wait:
+                            if gate_msg != last_wait_msg.get(rid):
+                                events.append(f"[WAIT] {name} {gate_msg}")
+                                last_wait_msg[rid] = gate_msg
+                            continue
+                        gate_since.pop(rid, None)
+                        last_wait_msg.pop(rid, None)
+                        if gate_msg:
+                            events.append(f"[GO] {name} {gate_msg}")
+                    else:
+                        events.append(f"[NEW] {name} ({rtype})")
 
                     if rc.get("is_number") and not rc.get("is_radar"):
                         if code:
@@ -641,7 +728,7 @@ def main_loop():
 
 def main():
     print()
-    print(f"  XMU Tronclass 全自动签到 v1.0")
+    print(f"  XMU Tronclass 全自动签到 v1.1")
     print(f"  {'=' * 46}")
     print(f"  学号: {STUDENT_ID}")
     print(f"  登录: xmulogin 纯 API (无浏览器)")
