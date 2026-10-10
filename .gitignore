@@ -1,7 +1,17 @@
 # Session / credentials — contains real auth tokens, never commit
 auto_checkin_session.json
+creds.env
+auto_checkin.pid
+checkin.log
+checkin.log.*
+checkin.log.bak-*
+start_trace.txt
+checkin_record.json
+code_missing_diag.json
 
 # Python
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 *.egg-info/

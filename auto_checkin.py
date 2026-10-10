@@ -33,6 +33,23 @@ from pathlib import Path
 import requests
 from xmulogin import xmulogin
 
+
+class _NoProxySession(requests.Session):
+    """统一忽略系统/环境代理的会话。
+
+    部署机是校园网直连；曾出现过残留的失效系统代理（127.0.0.1:5301，
+    无监听）把所有请求拦成 ProxyError，重启后连登录都会失败。
+    xmulogin 内部同样用 requests.Session()，替换类定义一并覆盖。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trust_env = False
+        self.proxies = {}
+
+
+requests.Session = _NoProxySession
+
 # ============================================================
 # 配置 —— 优先环境变量，否则交互输入
 # ============================================================
@@ -76,6 +93,13 @@ HEADERS_BASE = {
 GPS_DISTANCE_TOLERANCE = 5.0
 # 未知状态最大重试次数（超出后视为终端，不再重试）
 MAX_UNKNOWN_RETRIES = 10
+
+# 数字码诊断：rid → 最近一次 students-detail 原始响应；拿不到码时落盘一次
+LAST_DETAIL_RAW = {}
+_CODE_MISSING_DUMPED = set()
+# 数字码备用通道（课表日期接口）缓存与诊断
+TIMETABLE_CODE_CACHE = {}
+LAST_TIMETABLE_RAW = {}
 
 
 # ============================================================
@@ -131,7 +155,10 @@ def _load_cookies(session):
                 value=c["value"],
                 domain=c.get("domain", ""),
                 path=c.get("path", "/"),
-                expires=c.get("expires"),
+                # 忽略保存时的过期时间戳：cookie 是否有效由服务端判定。
+                # 会话运行中会被服务端滑动续期，而磁盘快照里的 expires
+                # 停留在保存时刻，重启载入时会被客户端提前丢弃（401）。
+                expires=None,
                 secure=c.get("secure", False),
                 rest=c.get("rest", {}),
             )
@@ -258,10 +285,61 @@ def get_rollcall_detail(rollcall_id, session):
     try:
         r = session.get(url, timeout=10)
         data = r.json()
+        if isinstance(data, dict):
+            # 留一份原始响应（剔除名单大数组）供取码失败时诊断
+            LAST_DETAIL_RAW[rollcall_id] = {
+                k: v for k, v in data.items() if k != "student_rollcalls"
+            }
+            LAST_DETAIL_RAW[rollcall_id]["_http_status"] = r.status_code
+            LAST_DETAIL_RAW[rollcall_id]["_n_students"] = len(
+                data.get("student_rollcalls") or [])
         return data.get("number_code"), data.get("status"), data.get("end_time")
     except Exception as e:
         print(f"  [X] 读取点名详情失败: {e}")
         return None, None, None
+
+
+def get_number_code_from_timetable(rollcall_id, course_id, rollcall_time, session):
+    """数字码备用通道：GET /api/timetable_rollcalls?course_ids=..&rollcall_date=..
+
+    2026-10-10 起 /api/rollcall/{id}/student_rollcalls 不再返回 number_code，
+    课程页改用这个日期接口（前端 getTimeTableRollcalls）。rollcall_date 取
+    rollcall_time 的 UTC 日期（已用多场历史点名回验）。返回码字符串或 None。
+    """
+    cached = TIMETABLE_CODE_CACHE.get(rollcall_id)
+    if cached:
+        return cached
+    try:
+        dt = datetime.fromisoformat(str(rollcall_time).replace("Z", "+00:00"))
+        date_str = dt.astimezone(timezone.utc).date().isoformat()
+    except Exception:
+        date_str = datetime.now(timezone.utc).date().isoformat()
+    try:
+        r = session.get(
+            f"{BASE_URL}/api/timetable_rollcalls",
+            params=[("course_ids", str(course_id)), ("rollcall_date", date_str)],
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        items = r.json().get("rollcalls") or []
+        LAST_TIMETABLE_RAW[rollcall_id] = {
+            "queried_course_id": str(course_id),
+            "queried_date": date_str,
+            "http_status": r.status_code,
+            "n_rollcalls": len(items),
+            "r_ids": [it.get("id") for it in items if isinstance(it, dict)][:20],
+        }
+        for item in items:
+            if not isinstance(item, dict) or str(item.get("id")) != str(rollcall_id):
+                continue
+            code = item.get("number_code")
+            if code:
+                TIMETABLE_CODE_CACHE[rollcall_id] = str(code)
+                return str(code)
+    except Exception:
+        pass
+    return None
 
 
 def _find_me(students):
@@ -749,6 +827,10 @@ def main_loop():
                         events.append(f"[NEW] {name} ({rtype})")
 
                     if rc.get("is_number") and not rc.get("is_radar"):
+                        if not code:
+                            # 旧详情接口已不再稳定提供数字码，走课表日期接口备用通道
+                            code = get_number_code_from_timetable(
+                                rid, cid, rc.get("rollcall_time"), session)
                         if code:
                             ok = answer_number(rid, code, session)
                             if ok:
@@ -759,6 +841,26 @@ def main_loop():
                                 events.append(f"[FAIL] 数字 {name} 提交失败，将重试")
                         else:
                             events.append(f"[!] {name} 签到码暂未获取，将重试")
+                            # 诊断取证：每个 rid 只落盘一次当时的原始详情响应
+                            if rid not in _CODE_MISSING_DUMPED:
+                                _CODE_MISSING_DUMPED.add(rid)
+                                try:
+                                    dump = {
+                                        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        "course": name,
+                                        "rid": rid,
+                                        "list_item": {
+                                            k: v for k, v in rc.items()
+                                            if not isinstance(v, (list, dict))
+                                        },
+                                        "detail_raw": LAST_DETAIL_RAW.get(rid),
+                                        "timetable_raw": LAST_TIMETABLE_RAW.get(rid),
+                                    }
+                                    with open(SESSION_FILE.parent / "code_missing_diag.json",
+                                              "a", encoding="utf-8") as f:
+                                        f.write(json.dumps(dump, ensure_ascii=False) + "\n")
+                                except Exception:
+                                    pass
 
                     elif rc.get("is_radar"):
                         ok, lat, lon = answer_radar_auto(rid, session)
